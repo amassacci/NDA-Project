@@ -1,0 +1,1210 @@
+---
+title: "Project"
+output: html_document
+date: "2024-05-31"
+css: custom.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(recount3)
+  library(reshape2)
+  library(biomaRt)
+  library(ggrepel)     # pca
+  library(factoextra)  # k-means
+  library(ggpubr)      # k-means
+  library(randomForest)
+  library(genefilter)  # lda
+  library(MASS)        # lda
+  library(pROC)
+  library(caret)
+  library(glmnet)
+})
+
+main_folder <- "/home/alice/ago2023/Desktop/unitn/NDA"
+```
+
+```{r}
+metadata <- suppressMessages(read_delim(file.path(main_folder,"SraRunTable.txt"), delim = ",")) 
+
+nevi <- metadata %>%
+  filter(tissue == "benign melanocytic nevi") %>%
+  filter(!Run=="SRR6916930") %>%
+  filter(!Run=="SRR6916894") %>%
+  filter(!Run=="SRR6916892")
+
+set.seed(1)
+melanoma <- metadata %>%
+  filter(tissue == "primary melanoma") %>%
+  filter(!Run=="SRR6916941") %>%
+  sample_n(20)
+
+groups <- rbind(melanoma,nevi) %>%
+  dplyr::select(Run,tissue) %>%
+  dplyr::rename("sample"=Run, "group"=tissue)
+```
+
+Download uniformly processed RNA-seq data from recount3
+```{r}
+## Get the expression data
+proj_info <- subset(
+    available_projects(),
+    project == "SRP136742" & project_type == "data_sources"
+    )
+rse_gene_SRP136742 <- create_rse(proj_info)
+rse_gene_SRP136742
+
+assay(rse_gene_SRP136742, "counts") <- transform_counts(rse_gene_SRP136742)
+ex <- rse_gene_SRP136742@assays@data@listData[["counts"]]
+ex <- as.data.frame(ex) %>%
+  dplyr::select(all_of(groups$sample))
+```
+
+Filtering lowly expressed genes
+```{r}
+suppressPackageStartupMessages({
+  library(edgeR)
+})
+
+myCPM <- cpm(ex)
+thresh <- myCPM > 0.3
+# summary of how many TRUEs there are in each row
+# There are 15023 genes that have TRUEs in all 12 samples.
+table(rowSums(thresh))
+# we would like to keep genes that have at least 2 TRUEs in each row of thresh
+keep <- rowSums(thresh) >= 10
+summary(keep)
+
+mat = ex[keep,]
+
+dim(ex)
+# [1] 63856    40
+dim(mat)
+# [1] 24567    40
+```
+
+Let's have a look and see whether our threshold of 0.3 does indeed correspond to a count of about 10. We will look at the first sample.  
+```{r}
+plot(myCPM[,1],ex[,1])
+# Let us limit the x and y-axis so we can actually look to see what is happening at the smaller counts
+plot(myCPM[,1],ex[,1],ylim=c(0,50),xlim=c(0,3),
+     xlab = "CPM",
+     ylab = "Read counts")
+# Add a vertical line at 0.3 CPM
+abline(v=0.3)
+
+png(file.path(main_folder,"CPM_threshold.png"), width = 2500, height = 1500, units="px",res=300)
+plot(myCPM[,1],ex[,1],ylim=c(0,50),xlim=c(0,3),
+     xlab = "CPM",
+     ylab = "Read counts")
+# Add a vertical line at 0.3 CPM
+abline(v=0.3)
+dev.off()
+```
+
+Histograms of counts per gene
+An overview of the distribution of the genes counts for the sample SRR6916902
+```{r}
+a <- ggplot(mat) +
+  geom_histogram(aes(x = SRR6916902), stat = "bin", bins = 200) +
+  ggtitle("Count Distribution for SRR6916902 sample") +
+  xlab("Raw expression counts") +
+  ylab("Number of genes") +
+  scale_x_continuous(labels=function(x) format(x, big.mark = "", scientific = FALSE))
+a
+
+b <- ggplot(mat) +
+  geom_histogram(aes(x = SRR6916902), stat = "bin", bins = 200) +
+  xlab("Raw expression counts (truncated axis)") +
+  ylab("Number of genes") +
+  scale_y_continuous(limits=c(0,2500)) +
+  scale_x_continuous(labels=function(x) format(x, big.mark = "", scientific = FALSE), 
+                     limits=c(0,2000))
+b
+
+c <- ggplot(log2(mat + 1)) +
+  geom_histogram(aes(x = SRR6916902), stat = "bin", bins = 200) +
+  ggtitle("Log2-transformed Count Distribution for SRR6916902 sample") +
+  xlab("Log2(counts+1)") +
+  ylab("Number of genes") 
+c
+
+
+png(file.path(main_folder,"hist_distribution_a.png"), width = 2500, height = 1500, units="px",res=300)
+a
+dev.off()
+
+png(file.path(main_folder,"hist_distribution_b.png"), width = 2500, height = 1500, units="px",res=300)
+b
+dev.off()
+
+png(file.path(main_folder,"hist_distribution_c.png"), width = 2500, height = 1500, units="px",res=300)
+c
+dev.off()
+```
+
+
+Boxplots of gene count distributions per sample
+To get better insights into the distribution per sample, boxplots offer a good perspective.
+We’ll check the distribution of read counts using a boxplot and we'll add some color to see if there is any difference between sample groups.  
+```{r}
+## boxplot BEFORE log2-transformation
+
+# Check distributions of samples using boxplots
+boxplot1_data <- melt(mat) %>%
+  dplyr::rename("sample"="variable") %>%
+  inner_join(.,groups)
+
+p1 <- ggplot(boxplot1_data, aes(x=sample, y=value, fill=group)) + 
+  geom_boxplot() + 
+  theme_bw() + 
+  ggtitle("Between-Sample Distribution") +
+  scale_fill_manual(values=c("#6a8532", "#d95d39")) +
+  ylab("Raw counts") + 
+  xlab("") + 
+  theme(title = element_text(size=12), 
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        text = element_text(size = 10),
+        axis.title=element_text(size=10),
+        legend.key.size = unit(0.8, "cm")) +
+  labs(fill = "Group")
+p1
+
+
+png(file.path(main_folder,"boxplot_pre_log-transformation.png"), width = 2500, height = 1500, units="px",res=300)
+p1
+dev.off()
+```
+
+```{r}
+## boxplot AFTER log2-transformation
+
+# Check distributions of samples using boxplots
+boxplot2_data <- melt(log2(mat+1)) %>%
+  dplyr::rename("sample"="variable") %>%
+  inner_join(.,groups)
+boxplot2_data$sample <- factor(boxplot2_data$sample , levels=groups$sample)
+
+p2 <- ggplot(boxplot2_data, aes(x=sample, y=value, fill=group)) + 
+  geom_boxplot() + 
+  theme_bw() + 
+  scale_fill_manual(values=c("#6a8532", "#d95d39")) +
+  ylab("Log2 Pseudocounts") + 
+  xlab("") + 
+  theme(title = element_text(size=12), 
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        text = element_text(size = 10),
+        axis.title=element_text(size=10),
+        legend.key.size = unit(0.8, "cm")) +
+  labs(fill = "Group") +
+  geom_hline(yintercept = median(as.matrix(log2(mat+1))), col="#297373", lwd = 0.8)
+p2
+
+
+png(file.path(main_folder,"boxplot_after_log-transformation.png"), width = 2500, height = 1500, units="px",res=300)
+p2
+dev.off()
+```
+From the boxplots we see that overall the density distributions of raw log-intensities are not identical but still not very different. If a sample is really far above or below the blue horizontal line we may need to investigate that sample further.
+
+
+
+NORMALIZATION
+```{r}
+## boxplot before normalization
+p2
+
+## Normalization to a median of 0
+# compute medians, then subtract them
+channel.medians=apply(log(mat+1),2,median)
+normalized.log.mat=sweep(log(mat+1),2,channel.medians,"-")
+
+## Scale Normalization
+scale.normalized.mat <- scale(normalized.log.mat)
+
+boxplot3_data <- melt(scale.normalized.mat) %>%
+  dplyr::select(-Var1) %>%
+  dplyr::rename("sample"="Var2") %>%
+  inner_join(.,groups)
+boxplot3_data$sample <- factor(boxplot3_data$sample , levels=groups$sample)
+
+p3 <- ggplot(boxplot3_data, aes(x=sample, y=value, fill=group)) + 
+  geom_boxplot() + 
+  theme_bw() + 
+  scale_fill_manual(values=c("#6a8532", "#d95d39")) +
+  ylab("Log2 Pseudocounts") + 
+  xlab("") + 
+  theme(title = element_text(size=12), 
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        text = element_text(size = 10),
+        axis.title=element_text(size=10),
+        legend.key.size = unit(0.8, "cm")) +
+  labs(fill = "Group")
+p3
+
+png(file.path(main_folder,"boxplot_after_normalization.png"), width = 2500, height = 1500, units="px",res=300)
+p3
+dev.off()
+```
+
+<!--
+Convert Ensembl IDs to gene names using biomaRt
+```{r}
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+genes <- data.frame(ensembl = rownames(mat))
+# run the query
+gene_IDs <- getBM(
+  attributes=c("ensembl_gene_id_version","hgnc_symbol","gene_biotype"),
+  filters=c("ensembl_gene_id_version"), 
+  values = genes$ensembl,
+  mart = ensembl)
+```
+
+count matrix is updated by matching to the retrieved annotation.
+```{r}
+gene_IDs <- gene_IDs %>%
+  filter(!hgnc_symbol=="") 
+
+mat_ann <- mat %>%
+  rownames_to_column("ensembl_gene_id_version") %>%
+  right_join(.,gene_IDs) %>%
+  dplyr::select(-gene_biotype, -ensembl_gene_id_version) %>%
+  group_by(hgnc_symbol) %>%
+  summarise_all(mean) %>%
+  column_to_rownames("hgnc_symbol")
+```
+-->
+
+Mapping ensembl gene ids to hgnc symbols from GTF
+```{r}
+gene_IDs <- suppressMessages(read_delim(file.path(main_folder,"hgnc_conversion.tsv"))) %>%
+  mutate(ensembl_gene_id_version = gsub("\\.\\d+$","",ensembl_gene_id_version,perl=TRUE))
+
+mat_ann <- mat %>%
+  rownames_to_column("ensembl_gene_id_version") %>%
+  mutate(ensembl_gene_id_version = gsub("\\.\\d+$","",ensembl_gene_id_version,perl=TRUE)) %>%
+  inner_join(.,gene_IDs) %>%
+  dplyr::select(-gene_biotype, -ensembl_gene_id_version) %>%
+  group_by(hgnc_symbol) %>%
+  summarise_all(mean) %>%
+  column_to_rownames("hgnc_symbol")
+```
+
+PCA on log-transformed data
+```{r}
+ex <- log(mat + 1)
+condition <- groups$group
+
+pca_data=prcomp(t(ex))
+summary(pca_data)
+screeplot(pca_data)
+
+p4 <- fviz_eig(pca_data, 
+         addlabels = TRUE, 
+         ylim = c(0, 70),
+         main="")
+p4
+
+png(file.path(main_folder,"pca_screeplot.png"), res=300, units = "px", width=2500, height=2000)
+p4
+dev.off()
+
+
+pca_data_perc=round(100*pca_data$sdev^2/sum(pca_data$sdev^2),1)
+df_pca_data = data.frame(PC1 = pca_data$x[,1], PC2 = pca_data$x[,2], sample = colnames(ex), condition=condition)
+
+# PCA for components 1&2
+p5 <- ggplot(df_pca_data, aes(PC1,PC2, colour = condition))+
+  geom_point(size=4)+
+  scale_color_manual(values=c("#6a8532", "#d95d39"))+
+  labs(colour = "Group")+
+  labs(x=paste0("PC1 (",pca_data_perc[1],"% variance)"), y=paste0("PC2 (",pca_data_perc[2],"% variance)") )
+p5
+
+png(file.path(main_folder,"PC1_vs_PC2.png"), res=300, units = "px", width=2500, height=2000)
+p5
+dev.off()
+
+
+
+# # PCA with labels
+# p4 <- ggplot(df_pca_data, aes(PC1,PC2, colour = col))+
+#   geom_point(size=4, show.legend = F, colour = col)+
+#   geom_label_repel(aes(label=sample, fill=condition), color="white", size=3, max.overlaps = Inf)+
+#   scale_fill_manual(values=c("#6a8532", "#d95d39"))+
+#   labs(x=paste0("PC1 (",pca_data_perc[1],"% variance)"), y=paste0("PC3 (",pca_data_perc[2],"% variance)") )
+# 
+# # Let's override some of the aesthetics
+# p4 <- p4 + guides(fill = guide_legend(
+#   title = "Group",
+#   override.aes = aes(label = ""))
+# )
+# p4
+# 
+# png(file.path(main_folder,"PC1_vs_PC2_labels.png"), res=300, units = "px", width=2500, height=2000)
+# p4
+# dev.off()
+
+# PCA for components 1&3
+df_pca_data = data.frame(PC1 = pca_data$x[,1], PC3 = pca_data$x[,3], sample = colnames(ex), condition=condition)
+
+p6 <- ggplot(df_pca_data, aes(PC1,PC3, colour = condition))+
+  geom_point(size=4)+
+  scale_color_manual(values=c("#6a8532", "#d95d39"))+
+  labs(colour = "Group")+
+  labs(x=paste0("PC1 (",pca_data_perc[1],"% variance)"), y=paste0("PC3 (",pca_data_perc[3],"% variance)") )
+p6
+
+png(file.path(main_folder,"PC1_vs_PC3.png"), res=300, units = "px", width=2500, height=2000)
+p6
+dev.off()
+```
+
+```{r}
+ex_ann <- log(mat_ann + 1)
+condition <- groups$group
+
+pca_data=prcomp(t(ex_ann))
+summary(pca_data)
+screeplot(pca_data)
+
+p4 <- fviz_eig(pca_data, 
+         addlabels = TRUE, 
+         ylim = c(0, 70),
+         main="")
+p4
+
+png(file.path(main_folder,"pca_screeplot_2.png"), res=300, units = "px", width=2500, height=2000)
+p4
+dev.off()
+
+
+pca_data_perc=round(100*pca_data$sdev^2/sum(pca_data$sdev^2),1)
+df_pca_data = data.frame(PC1 = pca_data$x[,1], PC2 = pca_data$x[,2], sample = colnames(ex_ann), condition=condition)
+
+# PCA for components 1&2
+p5 <- ggplot(df_pca_data, aes(PC1,PC2, colour = condition))+
+  geom_point(size=4)+
+  scale_color_manual(values=c("#6a8532", "#d95d39"))+
+  labs(colour = "Group")+
+  labs(x=paste0("PC1 (",pca_data_perc[1],"% variance)"), y=paste0("PC2 (",pca_data_perc[2],"% variance)") )
+p5
+
+png(file.path(main_folder,"PC1_vs_PC2_2.png"), res=300, units = "px", width=2500, height=2000)
+p5
+dev.off()
+
+
+# PCA for components 1&3
+df_pca_data = data.frame(PC1 = pca_data$x[,1], PC3 = pca_data$x[,3], sample = colnames(ex_ann), condition=condition)
+
+p6 <- ggplot(df_pca_data, aes(PC1,PC3, colour = condition))+
+  geom_point(size=4)+
+  scale_color_manual(values=c("#6a8532", "#d95d39"))+
+  labs(colour = "Group")+
+  labs(x=paste0("PC1 (",pca_data_perc[1],"% variance)"), y=paste0("PC3 (",pca_data_perc[3],"% variance)") )
+p6
+
+png(file.path(main_folder,"PC1_vs_PC3_2.png"), res=300, units = "px", width=2500, height=2000)
+p6
+dev.off()
+```
+
+
+
+
+
+```{r}
+set.seed(123)
+k <- 2
+kmeans_result <- kmeans(t(ex_ann), k, nstart = 25)
+table(kmeans_result$cluster)
+```
+
+```{r}
+# Dimension reduction using PCA
+res.pca <- prcomp(t(ex_ann),  scale = F)
+# Coordinates of individuals
+ind.coord <- as.data.frame(get_pca_ind(res.pca)$coord)
+# Add clusters obtained using the K-means algorithm
+ind.coord$cluster <- factor(kmeans_result$cluster)
+# Add groups from the original data set
+ind.coord$Group <- groups$group
+
+# plot
+p7 <- ggscatter(
+  ind.coord, x = "Dim.1", y = "Dim.2", 
+  color = "cluster", palette = c("#6a8532", "#d95d39"), ellipse = TRUE, ellipse.type = "convex",
+  shape = "Group", size = 4,  legend = "right", ggtheme = theme_bw(),
+  xlab = paste0("PC1 (", pca_data_perc[1], "% variance)" ),
+  ylab = paste0("PC2 (", pca_data_perc[2], "% variance)" )
+) +
+  stat_mean(aes(color = cluster), size = 5)
+p7
+
+png(file.path(main_folder,"kmeans_2.png"), res=300, units = "px", width=2500, height=2000)
+p7
+dev.off()
+```
+
+```{r}
+# plot
+p4 <- ggscatter(
+  ind.coord, x = "Dim.1", y = "Dim.2", 
+  color = "cluster", palette = c("#6a8532", "#d95d39"), ellipse = TRUE, ellipse.type = "convex",
+  shape = "Group", 
+  size = 4,  legend = "right", ggtheme = theme_bw(),
+  xlab = paste0("PC1 (", pca_data_perc[1], "% variance)" ),
+  ylab = paste0("PC2 (", pca_data_perc[2], "% variance)" )
+) +
+  stat_mean(aes(color = cluster), size = 8)
+
+p4 
+
+ggscatter(
+  ind.coord, x = "Dim.1", y = "Dim.2", 
+  color = "Group", palette = c("#6a8532", "#d95d39"), #ellipse = TRUE, ellipse.type = "convex",
+  shape = c(16,18), 
+  size = 4,  legend = "right", ggtheme = theme_bw(),
+  xlab = paste0("PC1 (", pca_data_perc[1], "% variance)" ),
+  ylab = paste0("PC2 (", pca_data_perc[2], "% variance)" )
+) +
+  stat_mean(aes(color = Group, shape = 18), size = 8)
+
+```
+
+
+
+Hierarchical Clustering
+```{r}
+# calculate distances (default: Eucledian distance)
+dist_matrix <- dist(t(ex))
+# perform hierarchical clustering using ? linkage 
+hc1 <- hclust(dist_matrix, method = "average")
+hc2 <- hclust(dist_matrix, method = "complete")
+hc3 <- hclust(dist_matrix, method = "single")
+hc4 <- hclust(dist_matrix, method = "ward.D2")
+plot(hc1, main = "Average Linkage", hang = -1, cex = 0.6, xlab="")
+plot(hc2, main = "Complete Linkage", hang = -1, cex = 0.6)
+plot(hc3, main = "Single Linkage", hang = -1, cex = 0.6)
+plot(hc4, main = "Ward Linkage", hang = -1, cex = 0.6)
+
+png(file.path(main_folder,"average_linkage.png"), res=300, units = "px", width=2500, height=2000)
+plot(hc1, main = "Average Linkage", hang = -1, cex = 0.6)
+dev.off()
+png(file.path(main_folder,"complete_linkage.png"), res=300, units = "px", width=2500, height=2000)
+plot(hc2, main = "Complete Linkage", hang = -1, cex = 0.6)
+dev.off()
+png(file.path(main_folder,"single_linkage.png"), res=300, units = "px", width=2500, height=2000)
+plot(hc3, main = "Single Linkage", hang = -1, cex = 0.6)
+dev.off()
+png(file.path(main_folder,"ward_linkage.png"), res=300, units = "px", width=2500, height=2000)
+plot(hc4, main = "Ward Linkage", hang = -1, cex = 0.6)
+dev.off()
+```
+
+```{r}
+groups <- rbind(melanoma,nevi) %>%
+  dplyr::select(Run,tissue) %>%
+  dplyr::rename("sample"=Run, "group"=tissue)
+
+target = c(rep(2,20), rep(1,20))
+
+Reference = groups$group
+Prediction <- cutree(hc1, k = 2)
+table(Prediction,Reference)
+confusionMatrix(as.factor(Prediction), as.factor(target), mode = "everything")
+
+Reference = groups$group
+Prediction <- cutree(hc2, k = 2)
+table(Prediction,Reference)
+confusionMatrix(as.factor(Prediction), as.factor(target), mode = "everything")
+
+Reference = groups$group
+Prediction <- cutree(hc3, k = 2)
+table(Prediction,Reference)
+confusionMatrix(as.factor(Prediction), as.factor(target), mode = "everything")
+
+Reference = groups$group
+Prediction <- cutree(hc4, k = 2)
+table(Prediction,Reference)
+confusionMatrix(as.factor(Prediction), as.factor(target), mode = "everything")
+```
+
+```{r}
+Reference = groups$group
+Prediction <- cutree(hc4, k = 2)
+plot(table(Reference, Prediction),
+     main="Confusion Matrix for Ward Clustering")
+png(file.path(main_folder,"ward_linkage_confusion_matrix.png"), res=300, units = "px", width=2500, height=2000)
+plot(table(Reference, Prediction), main="Confusion Matrix for Ward Clustering")
+dev.off()
+
+Prediction <- cutree(hc1, k = 2)
+plot(table(Reference, Prediction),
+     main="Confusion Matrix for Average Linkage")
+png(file.path(main_folder,"average_linkage_confusion_matrix.png"), res=300, units = "px", width=2500, height=2000)
+plot(table(Reference, Prediction), main="Confusion Matrix for Average Linkage")
+dev.off()
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(dendextend)
+})
+
+groups <- rbind(melanoma,nevi) %>%
+  dplyr::select(Run,tissue) %>%
+  dplyr::rename("sample"=Run, "group"=tissue)
+data <- as.data.frame(t(ex)) %>%
+  rownames_to_column("sample") %>%
+  inner_join(.,groups) %>%
+  relocate(group, .after=sample)
+
+groupCodes <- c(rep("primary melanoma",20), rep("benign melanocytic nevi",20))
+rownames(data) <- make.unique(groupCodes)
+colorCodes <- c(`primary melanoma`="#d95d39", `benign melanocytic nevi`="#6a8532")
+dist_matrix <- dist(data)
+hc4 <- hclust(dist_matrix, method = "ward.D2")
+dend <- as.dendrogram(hc4)
+# coloring the labels based on the real group category and coloring the branches based on cutting the tree into two clusters
+labels_colors(dend) <- colorCodes[groupCodes][order.dendrogram(dend)]
+
+labels(dend)
+new_label <- data %>%
+  dplyr::select(sample) %>%
+  rownames_to_column("label")
+new_label <- new_label[match(labels(dend), new_label$label),]
+
+condition <- unique(groups$group)
+
+dend %>%
+  set("labels_cex", 0.6) %>%
+  set("branches_k_color", value = c("black", "black"), k = 2) %>%
+  set("labels", new_label$sample) %>%
+  plot(main = "Ward Linkage")
+dend %>% 
+  rect.dendrogram(k=2, border = 8, lty = 1, lwd = 1.5)
+legend("topright", legend = condition, fill = c("#d95d39", "#6a8532"))
+
+
+png(file.path(main_folder,"ward_linkage_final.png"), res=300, units = "px", width=2500, height=2000)
+dend %>%
+  set("labels_cex", 0.8) %>%
+  set("branches_k_color", value = c("black", "black"), k = 2) %>%
+  set("labels", new_label$sample) %>%
+  plot(main = "Ward Linkage") 
+dend %>% 
+  rect.dendrogram(k=2, border = 8, lty = 1, lwd = 1.5)
+legend("topright", legend = condition, fill = c("#d95d39", "#6a8532"))
+dev.off()
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(dendextend)
+})
+
+groups <- rbind(melanoma,nevi) %>%
+  dplyr::select(Run,tissue) %>%
+  dplyr::rename("sample"=Run, "group"=tissue)
+data <- as.data.frame(t(ex)) %>%
+  rownames_to_column("sample") %>%
+  inner_join(.,groups) %>%
+  relocate(group, .after=sample)
+
+groupCodes <- c(rep("primary melanoma",20), rep("benign melanocytic nevi",20))
+rownames(data) <- make.unique(groupCodes)
+colorCodes <- c(`primary melanoma`="#d95d39", `benign melanocytic nevi`="#6a8532")
+dist_matrix <- dist(data)
+hc1 <- hclust(dist_matrix, method = "average")
+dend <- as.dendrogram(hc1)
+# coloring the labels based on the real group category and coloring the branches based on cutting the tree into two clusters
+labels_colors(dend) <- colorCodes[groupCodes][order.dendrogram(dend)]
+
+labels(dend)
+new_label <- data %>%
+  dplyr::select(sample) %>%
+  rownames_to_column("label")
+new_label <- new_label[match(labels(dend), new_label$label),]
+
+condition <- unique(groups$group)
+
+dend %>%
+  set("labels_cex", 0.6) %>%
+  set("branches_k_color", value = c("black", "black"), k = 2) %>%
+  set("labels", new_label$sample) %>%
+  plot(main = "Average Linkage")
+dend %>% 
+  rect.dendrogram(k=2, border = 8, lty = 1, lwd = 1.5)
+legend("topright", legend = condition, fill = c("#d95d39", "#6a8532"))
+
+
+png(file.path(main_folder,"average_linkage_final.png"), res=300, units = "px", width=2500, height=2000)
+dend %>%
+  set("labels_cex", 0.8) %>%
+  set("branches_k_color", value = c("black", "black"), k = 2) %>%
+  set("labels", new_label$sample) %>%
+  plot(main = "Average Linkage") 
+dend %>% 
+  rect.dendrogram(k=2, border = 8, lty = 1, lwd = 1.5)
+legend("topright", legend = condition, fill = c("#d95d39", "#6a8532"))
+dev.off()
+```
+
+```{r}
+Reference = groups$group
+Prediction <- cutree(hc4, k = 2)
+table(Prediction,Reference)
+
+Prediction <- cutree(hc1, k = 2)
+table(Prediction,Reference)
+```
+
+<!--
+```{r}
+##### train and test set
+set.seed(1234)
+nTest = floor(ncol(ex_ann) * 0.2)
+ind = sample(ncol(ex_ann), nTest, FALSE)
+
+train = ex_ann[, -ind]
+dim(train)
+
+test <- ex_ann[, ind]
+dim(test)
+
+# splitting phenodata
+meta_train <- groups[-ind,]
+meta_test <- groups[ind,] 
+
+# checking if phenodata and expression data are splitted in the same way
+colnames(test)
+meta_test$sample
+```
+-->
+
+<!--
+```{r}
+# build RF
+rf <- randomForest(x=t(train), y=as.factor(meta_train$group), ntree=1000)
+rf_pred <- predict(rf, t(test))
+rf_confusion = table(rf_pred, meta_test$group)
+rf_confusion
+
+# plot of sorted importance values
+varImpPlot(rf)
+
+
+
+# selection of top 200 most important genes in RF
+importance <- as.data.frame(rf$importance) %>%
+  arrange(desc(MeanDecreaseGini))
+top200 <- importance %>%
+  top_n(200)
+# write.csv(top200, file = "probes-top200.txt", quote=FALSE, row.names = FALSE, col.names=FALSE)
+```
+-->
+
+<!--
+```{r}
+ex <- as.matrix(log(mat_ann + 1))
+# ex = as.matrix(log(mat+1))
+f <- factor(c(rep("melanoma",20), rep("benign melanocytic nevi",20)))
+
+# feature selection step
+tt51 <- rowttests(ex,f)
+keepers <- which(tt51$p.value<0.05)
+ex2 <- ex[keepers,]
+tex2 <- t(ex2)
+dat <- cbind(f,as.data.frame(tex2))
+colnames(dat)[1] <- "GROUP"
+
+# Split the data into training (80%) and test set (20%) 
+set.seed(4321) 
+training.individuals <- dat$GROUP %>%  
+            createDataPartition(p = 0.8, list = FALSE) 
+train <- as.vector(training.individuals)
+test <- setdiff(1:40, train)
+length(train)
+length(test)
+
+mod <- lda(GROUP ~ ., data=dat, subset = train)
+
+mod.values <- predict(mod, dat[train,])
+mod.values$class
+ldahist(data = mod.values$x[,1], g = dat[train, "GROUP"])
+png(file.path(main_folder,"lda_histogram.png"), res=300, units = "px", width=2500, height=2000)
+ldahist(data = mod.values$x[,1], g = dat[train, "GROUP"])
+dev.off()
+
+plot(mod.values$x[,1], ylab=c("LDA Axis"))
+text(mod.values$x[,1],
+col=c(as.numeric(dat[train,"GROUP"])+10))
+png(file.path(main_folder,"lda_plot.png"), res=300, units = "px", width=2500, height=2000)
+plot(mod.values$x[,1], ylab=c("LDA Axis"))
+text(mod.values$x[,1],
+col=c(as.numeric(dat[train,"GROUP"])+10))
+dev.off()
+
+preds <- predict(mod, dat[test,])
+preds$class
+table(as.numeric(preds$class),
+as.numeric(dat[test, "GROUP"]) )
+# ROC
+roc_lda <- plot.roc(as.numeric(preds$class),
+as.numeric(dat[test, "GROUP"]) )
+png(file.path(main_folder,"roc_lda.png"), res=300, units = "px", width=2500, height=2000)
+plot.roc(as.numeric(preds$class),
+as.numeric(dat[test, "GROUP"]) )
+dev.off()
+```
+-->
+
+```{r}
+ex <- as.matrix(log(mat_ann + 1))
+f <- factor(c(rep("melanoma",20), rep("benign melanocytic nevi",20)))
+
+# feature selection step
+tt51 <- rowttests(ex,f)
+keepers <- which(tt51$p.value<0.05)
+ex2 <- ex[keepers,]
+tex2 <- t(ex2)
+dat <- cbind(f,as.data.frame(tex2))
+colnames(dat)[1] <- "GROUP"
+
+#dat <- cbind(f,as.data.frame(t(ex)))
+#colnames(dat)[1] <- "GROUP"
+
+# Split the data into training (80%) and test set (20%) 
+set.seed(4321) 
+training.individuals <- dat$GROUP %>%  
+            createDataPartition(p = 0.8, list = FALSE) 
+train <- as.vector(training.individuals)
+test <- setdiff(1:40, train)
+length(train)
+length(test)
+```
+
+<!--
+```{r}
+test_set <- read.csv(file.path(main_folder,"additional_test_set.tsv"), header = TRUE, row.names = 1, sep = "\t", check.names = FALSE)
+```
+-->
+
+```{r}
+# Run algorithms using 10-fold cross validation, 10 times
+control <- trainControl(method="cv", number=10, repeats = 10)
+metric <- "Accuracy"
+
+# LDA
+set.seed(1234)
+fit.lda <- train(GROUP~., data=dat[train,], method="lda", metric=metric, trControl=control)
+fit.lda
+
+
+# RF
+set.seed(1234)
+fit.rf <- train(GROUP~., data=dat[train,], method="rf", metric=metric, trControl=control, ntree = 1000)
+fit.rf
+fit.rf$results
+fit.rf$finalModel
+# feature importances
+varImp(fit.rf)
+rf_genes <- as.data.frame(fit.rf$finalModel$importance) %>%
+  arrange(-MeanDecreaseGini) %>%
+  rownames_to_column("gene") %>%
+  mutate(gene=gsub("`","",gene))
+write.table(rf_genes$gene, file.path(main_folder,"rf_genes.txt"), sep = "\t", quote=FALSE, row.names=F, col.names=F) 
+
+randomForest::varImpPlot(fit.rf$finalModel, main="Variable Importance") 
+png(file.path(main_folder,"rf_importance.png"), res=300, units = "px", width=2500, height=2000)
+randomForest::varImpPlot(fit.rf$finalModel, main="Variable Importance")
+dev.off()
+
+
+# LASSO
+set.seed(1234)
+fit.lasso <- train(GROUP~., data=dat[train,], 
+                   method="glmnet", trControl = control, metric = metric,
+                   family = "binomial", 
+                   tuneGrid = expand.grid(alpha = 1, lambda = seq(0.01,3, by=0.01))
+                   )
+plot(fit.lasso)
+
+
+
+preds.lda <- predict(fit.lda, dat[test,])
+table(preds.lda, dat[test,]$GROUP)
+confusionMatrix(preds.lda, dat[test,]$GROUP, mode = "everything") 
+
+test_set$GROUP <- factor(test_set$GROUP, levels = c("benign melanocytic nevi", "melanoma"))
+preds.lda <- predict(fit.lda, test_set)
+table(preds.lda, test_set$GROUP)
+confusionMatrix(preds.lda, test_set$GROUP, mode = "everything")
+
+preds.rf <- predict(fit.rf, dat[test,])
+table(preds.rf, dat[test,]$GROUP)
+confusionMatrix(preds.rf, dat[test,]$GROUP, mode = "everything") 
+
+preds.rf <- predict(fit.rf, test_set)
+table(preds.rf, test_set$GROUP)
+confusionMatrix(preds.rf, test_set$GROUP, mode = "everything")
+```
+
+```{r}
+# LASSO
+set.seed(1234) 
+fit.lasso0 <- train(GROUP~., data=dat[train,], 
+                   method="glmnet", trControl = control, metric = metric,
+                   family = "binomial", 
+                   tuneGrid = expand.grid(alpha = 1, lambda = seq(0.01,3, by=0.01))
+                   )
+
+# Best tuning parameter to minimize the root mean squared error (RMSE) of model
+fit.lasso0$bestTune
+fit.lasso0$bestTune$lambda
+print(paste0('Lasso best parameters: ' , fit.lasso0$finalModel$lambdaOpt))
+plot(fit.lasso0)
+png(file.path(main_folder,"lasso0_lambda.png"), res=300, units = "px", width=2500, height=2000)
+plot(fit.lasso0)
+dev.off()
+
+# Re-train the model with the a new grid with smaller values of lambda
+fit.lasso <- train(GROUP~., data=dat[train,], 
+                   method="glmnet", trControl = control, metric = metric,
+                   family = "binomial", 
+                   tuneGrid = expand.grid(alpha = 1, lambda = seq(0.01,0.5, by=0.001))
+                   )
+fit.lasso$bestTune
+fit.lasso$bestTune$lambda
+print(paste0('Lasso best parameters: ' , fit.lasso$finalModel$lambdaOpt))
+plot(fit.lasso)
+png(file.path(main_folder,"lasso_lambda.png"), res=300, units = "px", width=2500, height=2000)
+plot(fit.lasso)
+dev.off()
+
+fit.lasso$results[124,]
+```
+```{r}
+# LASSO regression model coefficients (parameter estimates)
+# Regression Coefficients for the final model (with the best performance)
+coefs <- coef(fit.lasso$finalModel, # Select the final model coefficients
+     fit.lasso$bestTune$lambda) # at the best lambda value
+coefs
+coefs.zero <- coefs[which(coefs[,1]==0),]
+length(coefs.zero)
+
+# Rank order the predictors based on the magnitude of the coefficients
+ind <- order(abs(coefs),decreasing=T)
+lasso_genes <- data.frame(coef = coefs[ind[-1],]) %>%
+  rownames_to_column("gene") %>%
+  filter(coef != 0) %>%
+  mutate(gene=gsub("`","",gene))
+write.table(lasso_genes$gene, file.path(main_folder,"lasso_genes.txt"), sep = "\t", quote=FALSE, row.names=F, col.names=F) 
+
+
+# Variable importance
+suppressPackageStartupMessages({
+  library(vip)
+})
+
+vip(fit.lasso, 
+    num_features = 12, 
+    geom = "point") + 
+theme_bw()
+png(file.path(main_folder,"lasso_importance_plot.png"), res=300, units = "px", width=2500, height=2000)
+vip(fit.lasso, 
+    num_features = 12, 
+    geom = "point") + 
+theme_bw()
+dev.off()
+```
+
+```{r}
+# plot coefficient paths as a function of lambda
+# plot(fit.lasso$finalModel, xvar = "lambda", label=TRUE, col = rainbow(20))
+plot(fit.lasso$finalModel, xvar = "lambda", label=FALSE, col = rainbow(20))
+abline(v=-2.017406)
+# log(fit.lasso$bestTune$lambda)
+png(file.path(main_folder,"lasso_coeff.png"), res=300, units = "px", width=2500, height=2000)
+plot(fit.lasso$finalModel, xvar = "lambda", label=FALSE, col = rainbow(20))
+abline(v=-2.017406)
+dev.off()
+
+# codebook for which variables the numbers correspond to
+rownames(fit.lasso$finalModel$beta)
+
+# e.g., What are variables 519 and 4?
+rownames(fit.lasso$finalModel$beta)[c(419,4)]
+```
+
+```{r}
+### Model prediction
+# Goal: See how well our model predicts when we give it new data
+predictions_LASSO <- predict(fit.lasso, # Use trained model
+                             newdata = dat[test,]) # To predict outcome with test data
+confusionMatrix(predictions_LASSO,dat[test,]$GROUP, mode = "everything")
+
+test_set$GROUP = factor(test_set$GROUP, levels=c("benign melanocytic nevi", "melanoma"))
+predictions_LASSO <- predict(fit.lasso,
+                             newdata = test_set)
+confusionMatrix(predictions_LASSO,test_set$GROUP, mode = "everything")
+
+
+preds.lasso2 <- predict(fit.lasso, dat[test,], type="raw", s=fit.lasso$finalModel$lambdaOpt)
+table(preds.lasso2, dat[test,]$GROUP)
+preds.lasso <- predict(fit.lasso, dat[test,], type="prob")
+
+f.categorical <- c(rep("primary melanoma",20), rep("benign melanocytic nevi",20))
+auc <- roc(f.categorical[test], preds.lasso[[2]])
+print(auc$auc)
+plot(auc) #area under the curve 0.9375
+
+png(file.path(main_folder,"lasso_auc.png"), res=300, units = "px", width=2500, height=2000)
+plot(auc)
+dev.off()
+```
+
+```{r}
+# comparison with other classification methods
+results <- resamples(list(RF=fit.rf, LDA=fit.lda, Lasso=fit.lasso))
+summary(results)
+ggplot(results) + labs(y = "Accuracy") + theme_linedraw()
+```
+
+<!--
+```{r}
+# rScudo
+y <- c(rep(0,20),rep(1,20))
+f <- factor(y, labels = c("melanoma","benign melanocytic nevi"))
+library(rScudo)
+trainData <- t(tex2[train,])
+testData <- t(tex2[test,])
+
+# analyze training set
+trainRes <- scudoTrain(trainData, groups = dat$GROUP[train], nTop = 10, nBottom = 10, alpha = 0.05)
+trainRes
+# inspect signatures
+upSignatures(trainRes)[1:5,1:5]
+consensusUpSignatures(trainRes)[1:5, ]
+# generate and plot map of training samples
+trainNet <- scudoNetwork(trainRes, N = 0.2)
+scudoPlot(trainNet, vertex.label = NA)
+
+# perform validation using testing samples
+testRes <- scudoTest(trainRes, testData, f[test], nTop = 20, nBottom = 20)
+testNet <- scudoNetwork(testRes, N = 0.2)
+scudoPlot(testNet, vertex.label = NA)
+
+# identify clusters on map
+library("igraph")
+testClust <- igraph::cluster_spinglass(testNet, spins = 2)
+plot(testClust, testNet, vertex.label = NA)
+# perform classification
+classRes <- scudoClassify(trainData, testData, N = 0.25, nTop = 12, nBottom = 12, trainGroups = f[inTrain], alpha = 0.5)
+caret::confusionMatrix(classRes$predicted, f[-inTrain])
+```
+-->
+
+```{r}
+# rScudo
+y <- c(rep(0,20),rep(1,20))
+f <- factor(y, labels = c("melanoma","benign melanocytic nevi"))
+library(rScudo)
+trainData <- t(tex2[train,])
+testData <- t(tex2[test,])
+
+
+set.seed(1234)
+# use caret to test a grid a values for nTop & nBottom using cross validation
+model <- scudoModel(nTop = (1:6)*5, nBottom = (1:6)*5, N = 0.25)
+control <- caret::trainControl(method = "cv", number = 5, summaryFunction = caret::multiClassSummary)
+cvRes <- caret::train(x = t(trainData), y = dat$GROUP[train], method = model, trControl = control)
+
+trainRes <- scudoTrain(trainData, groups = dat$GROUP[train], nTop = cvRes$bestTune$nTop, nBottom = cvRes$bestTune$nBottom, alpha = 0.05)
+trainRes
+# generate and plot map of training samples
+set.seed(1234)
+trainNet <- scudoNetwork(trainRes, N = 0.35)
+library("igraph")
+igraph::V(trainNet)$color
+V(trainNet)$color <- ifelse(V(trainNet)$color == "#00FFFF", "#d95d39", "#6a8532")
+scudoPlot(trainNet, vertex.label = NA, x = "bottom")
+
+png(file.path(main_folder,"scudo_train.png"), res=300, units = "px", width=2500, height=2000)
+scudoPlot(trainNet, vertex.label = NA, x = NA)
+dev.off()
+
+
+#library(RCy3)
+#scudoCytoscape(trainNet, title = "Scudo Graph", collection = "SCUDO")
+
+# identify clusters on map
+trainClust <- igraph::cluster_spinglass(trainNet, spins = 2)
+plot(trainClust, trainNet, vertex.label = NA)
+png(file.path(main_folder,"scudo_train_clusters.png"), res=300, units = "px", width=2500, height=2000)
+plot(trainClust, trainNet, vertex.label = NA)
+dev.off()
+```
+
+```{r}
+# plot map of testing samples using best nTop & nBottom values
+set.seed(1234)
+testRes <- scudoTest(trainRes, testData, f[test], cvRes$bestTune$nTop, cvRes$bestTune$nBottom)
+testNet <- scudoNetwork(testRes, N = 0.3)
+scudoPlot(testNet, vertex.label = NA)
+
+# identify clusters on map
+library("igraph")
+testClust <- igraph::cluster_spinglass(testNet, spins = 2)
+plot(testClust, testNet, vertex.label = NA)
+# perform classification of testing samples using best nTop & nBottom values
+classRes <- scudoClassify(trainData, testData, N = 0.25, cvRes$bestTune$nTop, cvRes$bestTune$nBottom, trainGroups = f[train], alpha = 0.5)
+caret::confusionMatrix(classRes$predicted, f[test])
+```
+
+<!--
+```{r}
+testData <- t(test_set %>%
+                dplyr::select(-GROUP))
+y <- c(rep(0,3),rep(1,37))
+f <- factor(y, labels = c("benign melanocytic nevi", "melanoma"))
+set.seed(1234)
+testRes <- scudoTest(trainRes, testData, f, cvRes$bestTune$nTop, cvRes$bestTune$nBottom)
+testNet <- scudoNetwork(testRes, N = 0.3)
+scudoPlot(testNet, vertex.label = NA)
+
+# identify clusters on map
+testClust <- igraph::cluster_spinglass(testNet, spins = 2)
+plot(testClust, testNet, vertex.label = NA)
+# perform classification of testing samples using best nTop & nBottom values
+classRes <- scudoClassify(trainData, testData, N = 0.25, cvRes$bestTune$nTop, cvRes$bestTune$nBottom, trainGroups = f[train], alpha = 0.5)
+caret::confusionMatrix(classRes$predicted, f, mode = "everything")
+```
+-->
+
+extract signatures
+```{r}
+scudo_up <- trainRes@consensusUpSignatures
+scudo_down <- trainRes@consensusDownSignatures
+
+scudo_genes <- rbind(scudo_up,scudo_down)
+
+write.table(sort(scudo_up$melanoma), file.path(main_folder,"scudo_up_melanoma.txt"), sep = "\t", quote=FALSE, row.names=F, col.names=F)
+write.table(sort(scudo_down$melanoma), file.path(main_folder,"scudo_down_melanoma.txt"), sep = "\t", quote=FALSE, row.names=F, col.names=F)
+
+write.table(sort(scudo_up$`benign melanocytic nevi`), file.path(main_folder,"scudo_up_nevi.txt"), sep = "\t", quote=FALSE, row.names=F, col.names=F)
+write.table(sort(scudo_down$`benign melanocytic nevi`), file.path(main_folder,"scudo_down_nevi.txt"), sep = "\t", quote=FALSE, row.names=F, col.names=F)
+```
+
+
+
+```{r}
+summary <- data.frame("Classification Algorithm"= c("RF","LDA","LASSO","SCUDO"),
+                      "Training Accuracy Score"= c("80.8%","84.1%","87.5%","84.3%"),
+                      "Test Accuracy Score"= c("100%","100%","87.5%","100%"),
+                      "2nd Test Accuracy Score"= c("87.5%","87.5%","92.5%","92.5%")
+                      )
+colnames(summary) <- c("Classification Algorithm","Training Accuracy Score","Test Accuracy Score", "2nd Test Accuracy Score")
+
+
+summary2 <- data.frame("Classification Algorithm"= c("RF","LDA","LASSO","SCUDO"),
+                      "Training Accuracy Score"= c("80.8%","84.1%","87.5%","84.3%"),
+                      "Test Accuracy Score"= c("100%","100%","87.5%","100%"),
+                      "2nd Test Accuracy Score"= c("87.5%","87.5%","92.5%","92.5%"),
+                      "2nd Test F1 Score"= c("0.5455","0.5455","0.5714","0")
+                      )
+colnames(summary2) <- c("Classification Algorithm","Training Accuracy Score","Test Accuracy Score", "2nd Test Accuracy Score", "2nd Test F1 Score")
+```
+
+
+```{r}
+summary <- data.frame("Classification Algorithm"= c("RF","LDA","LASSO","SCUDO"),
+                      "Training Accuracy Score"= c("82.5%","82.5%","100%","87.1%"),
+                      "Test Accuracy Score"= c("100%","100%","87.5%","100%"),
+                      "2nd Test Accuracy Score"= c("42.5%","50.0%","45.0%","95.0%")
+                      )
+colnames(summary) <- c("Classification Algorithm","Training Accuracy Score","Test Accuracy Score", "2nd Test Accuracy Score")
+
+
+summary2 <- data.frame("Classification Algorithm"= c("RF","LDA","LASSO","SCUDO"),
+                      "Training Accuracy Score"= c("82.5%","82.5%","100%","87.1%"),
+                      "Test Accuracy Score"= c("100%","100%","87.5%","100%"),
+                      "2nd Test Accuracy Score"= c("42.5%","50.0%","45.0%","95.0%"),
+                      "2nd Test F1 Score"= c("0","0.16667","0","0.5000")
+                      )
+colnames(summary2) <- c("Classification Algorithm","Training Accuracy Score","Test Accuracy Score", "2nd Test Accuracy Score", "2nd Test F1 Score")
+```
+
+
+
+AUTOGO
+```{r}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(xlsx)
+})
+```
+
+```{r}
+files <- list.files(path = "/home/alice/ago2023/Desktop/auto-go/R", recursive = T, all.files = T, full.names = T)
+invisible(sapply(files, source))
+
+# main_folder <- "/home/alice/ago2023/Desktop/unitn/NDA/autogo/"
+```
+
+```{r}
+counts <- mat_ann %>%
+  rownames_to_column("gene_id")
+
+comparisons <- data.frame(treatment = "primary melanoma",
+                          control = "benign melanocytic nevi")
+```
+
+```{r}
+# deseq_analysis(counts, groups, comparisons, padj_threshold = 0.05, log2FC_threshold = 1, pre_filtering = T, save_excel = T, where_results = main_folder, outfolder = "differential_analysis_0724/")
+
+suppressPackageStartupMessages({
+  library(pathfindR)
+})
+
+autogo <- readxl::read_xlsx(file.path(main_folder,"autogo/DE_benign melanocytic nevi_vs_primary melanoma_allres.xlsx"))
+scudo_all <- read_tsv(file.path(main_folder,"scudo_genes.txt"), show_col_types = FALSE, col_names = "gene")
+all_scudo_genes <- autogo %>%
+  filter(genes %in% scudo_all$gene) %>%
+  dplyr::select(genes,log2FoldChange,padj)
+all_scudo_genes <- as.data.frame(all_scudo_genes)
+  
+output_df1 <- run_pathfindR(all_scudo_genes, iterations = 1, gene_sets = "GO-MF", min_gset_size = 5, output_dir = "/home/alice/ago2023/Desktop/unitn/NDA/pathfindr-GO-MF")
+
+output_df2 <- run_pathfindR(all_scudo_genes, iterations = 1, gene_sets = "KEGG", min_gset_size = 5, output_dir = "/home/alice/ago2023/Desktop/unitn/NDA/pathfindr-KEGG")
+
+output_df3 <- run_pathfindR(all_scudo_genes, iterations = 1, gene_sets = "GO-All", min_gset_size = 5, output_dir = "/home/alice/ago2023/Desktop/unitn/NDA/pathfindr-GO-All")
+
+## cluster enriched terms
+cluster_enriched_terms(output_df3)
+## term-gene graph of top 10 terms
+term_gene_graph(output_df3)
+## visualizing enriched term diagrams
+visualize_terms(output_df3)
+
+term_gene_heatmap(output_df3)
+```
+
+
+
+
+```{r}
+up_melanoma <- read_tsv(file.path(main_folder,"scudo_up_melanoma.txt"), show_col_types = FALSE, col_names = "gene")
+down_melanoma <- read_tsv(file.path(main_folder,"scudo_down_melanoma.txt"), show_col_types = FALSE, col_names = "gene")
+```
+
+
+
+
